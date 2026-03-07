@@ -193,7 +193,7 @@ def _split_paragraphs(text: str) -> List[Dict[str, Any]]:
 
         stripped_start = text.find(para_text, char_start)
         sentences = []
-        for m in re.finditer(r"[^.!?]+[.!?]+", para_text):
+        for m in re.finditer(r"[^.!?\n]+[.!?]+|[^\n]+", para_text):
             raw = m.group()
             abs_char   = stripped_start + m.start()
             abs_char_e = stripped_start + m.end()

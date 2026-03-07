@@ -37,7 +37,7 @@ def _content_words(sentence_text: str) -> Set[str]:
 
 def _split_sentences_in(para_text: str, para_byte_start: int) -> List[Dict[str, Any]]:
     sentences = []
-    for m in re.finditer(r"[^.!?]+[.!?]+", para_text):
+    for m in re.finditer(r"[^.!?\n]+[.!?]+|[^\n]+", para_text):
         raw    = m.group()
         abs_s  = para_byte_start + len(para_text[:m.start()].encode("utf-8"))
         abs_e  = para_byte_start + len(para_text[:m.end()].encode("utf-8"))

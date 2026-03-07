@@ -36,7 +36,7 @@ _THE_RE = re.compile(r"^\s*The\s", re.IGNORECASE)
 
 def _split_sentences(text: str) -> List[Dict[str, Any]]:
     sentences = []
-    for m in re.finditer(r"[^.!?]+[.!?]+", text):
+    for m in re.finditer(r"[^.!?\n]+[.!?]+|[^\n]+", text):
         raw    = m.group()
         s_byte = len(text[:m.start()].encode("utf-8"))
         e_byte = len(text[:m.end()].encode("utf-8"))

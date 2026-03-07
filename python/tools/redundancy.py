@@ -23,11 +23,25 @@ from .shared import build_positions, make_flag
 # ---------------------------------------------------------------------------
 
 _DEFAULTS = {
-    "frequency_sensitivity": 50.0,
-    "decay_rate":            2.0,
-    "similarity_threshold":  0.82,
-    "min_severity":          0.03,
-    "window":                300,
+    "frequency_sensitivity":          50.0,
+    "decay_rate":                     2.0,
+    "similarity_threshold":           0.82,
+    "min_severity":                   0.03,
+    "window":                         300,
+    "stopword_sensitivity_multiplier": 10.0,
+}
+
+# Common function words — expected to repeat constantly; apply sharper dropoff
+_FUNCTION_WORDS = {
+    "the", "and", "of", "to", "in", "for", "on", "with", "at", "by",
+    "from", "or", "but", "as", "is", "are", "was", "were", "be", "been",
+    "being", "have", "has", "had", "do", "does", "did", "will", "would",
+    "could", "should", "may", "might", "shall", "can", "not", "no", "so",
+    "if", "then", "than", "that", "this", "these", "those", "it", "its",
+    "he", "she", "they", "we", "you", "me", "him", "her", "them", "us",
+    "my", "your", "his", "our", "their", "an", "up", "out", "about",
+    "into", "through", "over", "after", "before", "between", "each",
+    "also", "just", "more", "when", "which", "who", "what", "how",
 }
 
 
@@ -43,8 +57,10 @@ def _decay(distance: int, rate: float) -> float:
     return 1.0 / math.log(math.e + distance * rate)
 
 
-def _freq_weight(word: str, counter: Counter, total: int, sensitivity: float) -> float:
-    return 1.0 / (1.0 + sensitivity * (counter[word] / total))
+def _freq_weight(word: str, counter: Counter, total: int, sensitivity: float,
+                 stopword_multiplier: float) -> float:
+    eff = sensitivity * (stopword_multiplier if word in _FUNCTION_WORDS else 1.0)
+    return 1.0 / (1.0 + eff * (counter[word] / total))
 
 
 # ---------------------------------------------------------------------------
@@ -54,11 +70,12 @@ def _freq_weight(word: str, counter: Counter, total: int, sensitivity: float) ->
 def analyse(text: str, config: Dict[str, Any]) -> Dict[str, Any]:
     cfg = {**_DEFAULTS, **config}
 
-    freq_sens  = float(cfg["frequency_sensitivity"])
-    decay_rate = float(cfg["decay_rate"])
-    sim_thresh = float(cfg["similarity_threshold"])
-    min_sev    = float(cfg["min_severity"])
-    window     = int(cfg["window"])
+    freq_sens        = float(cfg["frequency_sensitivity"])
+    decay_rate       = float(cfg["decay_rate"])
+    sim_thresh       = float(cfg["similarity_threshold"])
+    min_sev          = float(cfg["min_severity"])
+    window           = int(cfg["window"])
+    stopword_mult    = float(cfg["stopword_sensitivity_multiplier"])
 
     positions = build_positions(text)
     if not positions:
@@ -87,8 +104,8 @@ def analyse(text: str, config: Dict[str, Any]) -> Dict[str, Any]:
             if sim < sim_thresh:
                 continue
 
-            fwa = _freq_weight(wa, counter, total, freq_sens)
-            fwb = _freq_weight(wb, counter, total, freq_sens)
+            fwa = _freq_weight(wa, counter, total, freq_sens, stopword_mult)
+            fwb = _freq_weight(wb, counter, total, freq_sens, stopword_mult)
             dec = _decay(dist, decay_rate)
             sev = sim * fwa * fwb * dec
 

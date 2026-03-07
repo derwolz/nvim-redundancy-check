@@ -163,9 +163,11 @@ end
 local function place_mark(tool_name, bufnr, s_line, s_col, e_col, hl_group)
   local ns = namespaces[tool_name]
   if not ns then return end
+  local lines = vim.api.nvim_buf_get_lines(bufnr, s_line, s_line + 1, false)
+  local safe_e_col = math.min(e_col, #(lines[1] or ""))
   return vim.api.nvim_buf_set_extmark(bufnr, ns, s_line, s_col, {
     end_row  = s_line,
-    end_col  = e_col,
+    end_col  = safe_e_col,
     hl_group = hl_group,
     priority = 150,
   })
@@ -175,20 +177,34 @@ end
 -- Internal: apply flagged (red) highlights for all flags of a tool
 -- ---------------------------------------------------------------------------
 
+-- Cache line byte lengths to avoid repeated API calls during mark application
+local function _make_line_len_cache(bufnr)
+  local cache = {}
+  return function(lnum)
+    if cache[lnum] == nil then
+      local lines = vim.api.nvim_buf_get_lines(bufnr, lnum, lnum + 1, false)
+      cache[lnum] = #(lines[1] or "")
+    end
+    return cache[lnum]
+  end
+end
+
 local function apply_flagged_marks(tool_name, bufnr)
   local s = state[tool_name] and state[tool_name][bufnr]
   if not s then return end
   local ns = namespaces[tool_name]
   local hl = hl_defs[tool_name]
+  local line_len = _make_line_len_cache(bufnr)
   for _, flag in ipairs(s.flags) do
     local sev     = flag.severity or 0
     local sign_ch = sev >= 0.7 and "● " or (sev >= 0.4 and "▸ " or "· ")
     local vt      = cfg.virtual_text
                     and {{ string.format(" · %d%%", math.floor(sev * 100)), "Comment" }}
                     or nil
+    local safe_e_col = math.min(flag.e_col, line_len(flag.s_line))
     vim.api.nvim_buf_set_extmark(bufnr, ns, flag.s_line, flag.s_col, {
       end_row       = flag.s_line,
-      end_col       = flag.e_col,
+      end_col       = safe_e_col,
       hl_group      = hl.flagged,
       sign_text     = sign_ch,
       sign_hl_group = "QuillSign_" .. tool_name,
