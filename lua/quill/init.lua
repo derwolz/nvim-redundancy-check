@@ -16,7 +16,7 @@ local core = require("quill.core")
 local TOOLS = {
   { name="redundancy",  keymap="lr", desc="Redundancy check",
     hl_flagged={bg="#4a1010", fg="#ff8080", bold=true},
-    hl_related ={bg="#0d2a4a", fg="#80c8ff", bold=true} },
+    hl_related ={bg="#003333", fg="#00e5e5", bold=true} },
   { name="rhythm",      keymap="lR", desc="Rhythm & readability",
     hl_flagged={bg="#1a2a00", fg="#a8c000", bold=true},
     hl_related ={bg="#0a1a00", fg="#70a000", bold=true} },
