@@ -2,20 +2,50 @@
 python/tools/redundancy.py
 Redundancy checker for quill.nvim.
 
-Detects words that are semantically similar (by Levenshtein ratio) within a
+Detects words that are semantically similar (by SequenceMatcher ratio) within a
 rolling window, with frequency-dampening and distance decay.
 
 Each pair produces TWO flag entries sharing the same `group` id, one for each
-word in the pair. This lets the Lua cursor handler blue-highlight both members
+word in the pair. This lets the Lua cursor handler cyan-highlight both members
 when the user hovers over either one.
+
+Performance notes
+-----------------
+Three cheap pre-filters are applied before the expensive similarity call:
+  1. Length-ratio reject  – if the ratio of lengths can't possibly reach the
+     threshold, skip (O(1)).
+  2. Trigram disjoint check – words with zero shared character trigrams are
+     nearly guaranteed to be below threshold; checked with a frozenset
+     (O(word_len), not O(word_len²)).
+  3. rapidfuzz (optional)  – if installed (`pip install rapidfuzz`), the
+     similarity call is done in C++ with an early-exit score_cutoff, giving
+     10-100× speedup over pure-Python SequenceMatcher.
 """
 
 import math
 from collections import Counter
-from difflib import SequenceMatcher
 from typing import Any, Dict, List
 
 from .shared import build_positions, make_flag
+
+
+# ---------------------------------------------------------------------------
+# Fast similarity backend — rapidfuzz when available, difflib fallback
+# ---------------------------------------------------------------------------
+
+try:
+    from rapidfuzz import fuzz as _rf
+
+    def _similarity(a: str, b: str, cutoff: float = 0.0) -> float:
+        # score_cutoff causes early exit if the score can't reach the threshold;
+        # returns 0.0 in that case.  Divide by 100 to match difflib's 0–1 range.
+        return _rf.ratio(a, b, score_cutoff=cutoff * 100) / 100.0
+
+except ImportError:
+    from difflib import SequenceMatcher as _SM  # type: ignore
+
+    def _similarity(a: str, b: str, cutoff: float = 0.0) -> float:  # noqa: F811
+        return _SM(None, a, b).ratio()
 
 
 # ---------------------------------------------------------------------------
@@ -23,11 +53,11 @@ from .shared import build_positions, make_flag
 # ---------------------------------------------------------------------------
 
 _DEFAULTS = {
-    "frequency_sensitivity":          50.0,
-    "decay_rate":                     2.0,
-    "similarity_threshold":           0.82,
-    "min_severity":                   0.03,
-    "window":                         300,
+    "frequency_sensitivity":           50.0,
+    "decay_rate":                      2.0,
+    "similarity_threshold":            0.82,
+    "min_severity":                    0.03,
+    "window":                          300,
     "stopword_sensitivity_multiplier": 10.0,
 }
 
@@ -49,8 +79,11 @@ _FUNCTION_WORDS = {
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, a, b).ratio()
+def _trigrams(word: str) -> frozenset:
+    """Character trigrams of a word; falls back to the word itself if short."""
+    if len(word) < 3:
+        return frozenset([word])
+    return frozenset(word[i:i + 3] for i in range(len(word) - 2))
 
 
 def _decay(distance: int, rate: float) -> float:
@@ -70,12 +103,12 @@ def _freq_weight(word: str, counter: Counter, total: int, sensitivity: float,
 def analyse(text: str, config: Dict[str, Any]) -> Dict[str, Any]:
     cfg = {**_DEFAULTS, **config}
 
-    freq_sens        = float(cfg["frequency_sensitivity"])
-    decay_rate       = float(cfg["decay_rate"])
-    sim_thresh       = float(cfg["similarity_threshold"])
-    min_sev          = float(cfg["min_severity"])
-    window           = int(cfg["window"])
-    stopword_mult    = float(cfg["stopword_sensitivity_multiplier"])
+    freq_sens     = float(cfg["frequency_sensitivity"])
+    decay_rate    = float(cfg["decay_rate"])
+    sim_thresh    = float(cfg["similarity_threshold"])
+    min_sev       = float(cfg["min_severity"])
+    window        = int(cfg["window"])
+    stopword_mult = float(cfg["stopword_sensitivity_multiplier"])
 
     positions = build_positions(text)
     if not positions:
@@ -85,34 +118,47 @@ def analyse(text: str, config: Dict[str, Any]) -> Dict[str, Any]:
     total   = len(norms)
     counter = Counter(norms)
 
+    # Pre-compute trigram sets once — O(n * word_len)
+    tri_sets = [_trigrams(w) for w in norms]
+
     flags: List[Dict[str, Any]] = []
-    seen:  set = set()
-    group_id   = 0
+    group_id = 0
 
     for i in range(len(positions)):
+        wa    = norms[i]
+        len_a = len(wa)
+        tris_a = tri_sets[i]
+
         for j in range(i + 1, min(i + window, len(positions))):
-            key = (i, j)
-            if key in seen:
+            wb    = norms[j]
+            len_b = len(wb)
+
+            # --- Pre-filter 1: length ratio (O(1)) ----------------------------
+            # SequenceMatcher ratio ≤ 2*min_len / (len_a + len_b).
+            # If that ceiling is already below the threshold, skip.
+            if 2.0 * min(len_a, len_b) / (len_a + len_b) < sim_thresh:
                 continue
-            seen.add(key)
 
-            wa   = positions[i]["word"]
-            wb   = positions[j]["word"]
-            dist = j - i
+            # --- Pre-filter 2: trigram disjoint check (O(word_len)) -----------
+            # Words that share no character trigram almost never reach the
+            # threshold; eliminate them without calling the similarity function.
+            if tris_a.isdisjoint(tri_sets[j]):
+                continue
 
-            sim = _similarity(wa, wb)
+            # --- Full similarity (now called on a small fraction of pairs) ----
+            sim = _similarity(wa, wb, cutoff=sim_thresh)
             if sim < sim_thresh:
                 continue
 
-            fwa = _freq_weight(wa, counter, total, freq_sens, stopword_mult)
-            fwb = _freq_weight(wb, counter, total, freq_sens, stopword_mult)
-            dec = _decay(dist, decay_rate)
-            sev = sim * fwa * fwb * dec
+            dist = j - i
+            fwa  = _freq_weight(wa, counter, total, freq_sens, stopword_mult)
+            fwb  = _freq_weight(wb, counter, total, freq_sens, stopword_mult)
+            dec  = _decay(dist, decay_rate)
+            sev  = sim * fwa * fwb * dec
 
             if sev < min_sev:
                 continue
 
-            # Flag for word A
             pa = positions[i]
             flags.append(make_flag(
                 pa["s_line"], pa["s_col"], pa["e_col"],
@@ -121,7 +167,6 @@ def analyse(text: str, config: Dict[str, Any]) -> Dict[str, Any]:
                 group=group_id,
             ))
 
-            # Flag for word B
             pb = positions[j]
             flags.append(make_flag(
                 pb["s_line"], pb["s_col"], pb["e_col"],
