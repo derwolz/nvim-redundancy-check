@@ -446,7 +446,101 @@ function M._partial_reanalyse(tool_name, bufnr, center_line)
 end
 
 -- ---------------------------------------------------------------------------
+-- Chunked analysis helpers
+--
+-- The document is split into 500-word PRIMARY zones.  Each zone is analysed
+-- together with a WINDOW-word overlap so pairs near zone boundaries are never
+-- missed.  Only flags whose first word falls in the primary zone are kept,
+-- EXCEPT when a flag's group-mate is in the overlap — both are kept so the
+-- pair remains intact across the boundary.
+-- ---------------------------------------------------------------------------
+
+local _CHUNK_WORDS = 500   -- words owned by each primary zone
+
+-- Compute chunk line boundaries.  Returns chunks list + all_lines (read once).
+local function _chunk_boundaries(bufnr)
+  local all_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local total     = #all_lines
+  local overlap   = math.max(1, cfg.window or 300)
+
+  local function advance(from, budget)
+    local count, l = 0, from
+    while l < total and count < budget do
+      for _ in (all_lines[l + 1] or ""):gmatch("%S+") do count = count + 1 end
+      l = l + 1
+    end
+    return l
+  end
+
+  local chunks, line = {}, 0
+  while line < total do
+    local p = advance(line, _CHUNK_WORDS)
+    local a = math.min(advance(p, overlap), total)
+    table.insert(chunks, { start = line, primary_end = p, analysis_end = a })
+    line = p
+  end
+  return chunks, all_lines
+end
+
+-- Run backend on one chunk; call on_done(flags, meta) asynchronously.
+-- Flags are filtered/offset so callers receive buffer-absolute line numbers.
+local function _run_chunk(tool_name, chunk, all_lines, on_done)
+  local lines = {}
+  for i = chunk.start + 1, chunk.analysis_end do
+    table.insert(lines, all_lines[i])
+  end
+
+  local tmp = vim.fn.tempname() .. ".txt"
+  vim.fn.writefile(lines, tmp)
+
+  local acc = {}
+  vim.fn.jobstart({
+    python_exe(), backend_path(), "--tool", tool_name, tmp, vim.json.encode(cfg)
+  }, {
+    stdout_buffered = true,
+    on_stdout = function(_, data) for _, c in ipairs(data) do table.insert(acc, c) end end,
+    on_stderr = function(_, data)
+      for _, ln in ipairs(data) do
+        if ln ~= "" then vim.notify("[quill/" .. tool_name .. "] " .. ln, vim.log.levels.WARN) end
+      end
+    end,
+    on_exit = function(_, code)
+      vim.fn.delete(tmp)
+      if code ~= 0 then on_done(nil); return end
+      local ok, parsed = pcall(vim.json.decode, table.concat(acc, "\n"))
+      if not ok or type(parsed) ~= "table" or not parsed.flags then on_done(nil); return end
+
+      local primary_rel = chunk.primary_end - chunk.start
+
+      -- Groups that have at least one member in the primary zone are "owned"
+      -- by this chunk; keep ALL members of those groups (even overlap-zone ones)
+      -- so cross-boundary pairs remain intact.
+      local owned_groups = {}
+      for _, flag in ipairs(parsed.flags) do
+        if flag.s_line < primary_rel and flag.group ~= nil then
+          owned_groups[flag.group] = true
+        end
+      end
+
+      local kept = {}
+      for _, flag in ipairs(parsed.flags) do
+        local in_primary  = flag.s_line < primary_rel
+        local group_owned = flag.group ~= nil and owned_groups[flag.group]
+        if in_primary or group_owned then
+          local nf  = vim.deepcopy(flag)
+          nf.s_line = flag.s_line + chunk.start
+          table.insert(kept, nf)
+        end
+      end
+      on_done(kept, parsed.meta)
+    end,
+  })
+end
+
+-- ---------------------------------------------------------------------------
 -- run(tool_name, bufnr)
+-- Analyses the buffer in 500-word chunks, starting from the cursor chunk
+-- so the visible area gets results immediately.
 -- ---------------------------------------------------------------------------
 
 function M.run(tool_name, bufnr)
@@ -463,85 +557,92 @@ function M.run(tool_name, bufnr)
     return
   end
 
-  if vim.bo[bufnr].modified then
-    vim.cmd("write")
+  if vim.bo[bufnr].modified then vim.cmd("write") end
+
+  -- Fresh state; marks cleared immediately
+  state[tool_name][bufnr] = { flags={}, marks={}, active=true, meta={}, filepath=filepath }
+  clear_marks(tool_name, bufnr)
+
+  _ensure_hover_autocmd(bufnr)
+  _ensure_edit_autocmd(tool_name, bufnr)
+
+  local augroup = "QuillCursor_" .. tool_name .. "_" .. bufnr
+  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+    buffer   = bufnr,
+    group    = vim.api.nvim_create_augroup(augroup, { clear = true }),
+    callback = function() on_cursor_moved(tool_name, bufnr) end,
+  })
+
+  local chunks, all_lines = _chunk_boundaries(bufnr)
+  if #chunks == 0 then
+    vim.notify("[quill/" .. tool_name .. "] Buffer is empty.", vim.log.levels.WARN)
+    return
   end
 
-  local backend = backend_path()
-  local python  = python_exe()
-  local config_json = vim.json.encode(cfg)
+  -- Reorder so cursor chunk runs first → immediate feedback on visible area
+  local cursor_line = vim.api.nvim_win_get_cursor(0)[1] - 1
+  local cursor_idx  = 1
+  for k, chunk in ipairs(chunks) do
+    if cursor_line >= chunk.start and cursor_line < chunk.primary_end then
+      cursor_idx = k; break
+    end
+  end
+  local ordered = { chunks[cursor_idx] }
+  for k, chunk in ipairs(chunks) do
+    if k ~= cursor_idx then table.insert(ordered, chunk) end
+  end
 
-  vim.notify("[quill/" .. tool_name .. "] Analysing…", vim.log.levels.INFO)
+  local group_offset = 0
+  local total_count  = 0
 
-  local stdout_chunks = {}
+  vim.notify(
+    string.format("[quill/%s] Analysing (%d chunk%s)…",
+      tool_name, #ordered, #ordered == 1 and "" or "s"),
+    vim.log.levels.INFO
+  )
 
-  vim.fn.jobstart({
-    python, backend, "--tool", tool_name, filepath, config_json
-  }, {
-    stdout_buffered = true,
-    on_stdout = function(_, data)
-      for _, chunk in ipairs(data) do
-        table.insert(stdout_chunks, chunk)
-      end
-    end,
-    on_stderr = function(_, data)
-      for _, line in ipairs(data) do
-        if line ~= "" then
-          vim.notify("[quill/" .. tool_name .. "] " .. line, vim.log.levels.ERROR)
-        end
-      end
-    end,
-    on_exit = function(_, code)
-      if code ~= 0 then
-        vim.notify("[quill/" .. tool_name .. "] failed (exit " .. code .. ")", vim.log.levels.ERROR)
-        return
-      end
-
-      local raw = table.concat(stdout_chunks, "\n")
-      local ok, parsed = pcall(vim.json.decode, raw)
-
-      if not ok or type(parsed) ~= "table" then
-        vim.notify("[quill/" .. tool_name .. "] Could not parse output.", vim.log.levels.ERROR)
-        return
-      end
-
-      if parsed.error then
-        vim.notify("[quill/" .. tool_name .. "] " .. parsed.error, vim.log.levels.ERROR)
-        return
-      end
-
-      state[tool_name][bufnr] = {
-        flags    = parsed.flags or {},
-        marks    = {},
-        active   = true,
-        meta     = parsed.meta or {},
-        filepath = filepath,
-      }
-
-      _ensure_hover_autocmd(bufnr)
-      _ensure_edit_autocmd(tool_name, bufnr)
+  local function process_next(idx)
+    if idx > #ordered then
+      -- All chunks done — final redraw with every flag
       clear_marks(tool_name, bufnr)
       apply_flagged_marks(tool_name, bufnr)
-
-      local n   = #state[tool_name][bufnr].flags
-      local meta = parsed.meta or {}
       vim.notify(
-        string.format("[quill/%s] %d flag%s (%d ms). Hover to see relations.",
-          tool_name, n, n == 1 and "" or "s", meta.duration_ms or 0),
+        string.format("[quill/%s] %d flag%s.", tool_name, total_count, total_count == 1 and "" or "s"),
         vim.log.levels.INFO
       )
+      return
+    end
 
-      -- Register CursorMoved autocmd for this tool+buffer
-      local augroup = "QuillCursor_" .. tool_name .. "_" .. bufnr
-      vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
-        buffer  = bufnr,
-        group   = vim.api.nvim_create_augroup(augroup, { clear = true }),
-        callback = function()
-          on_cursor_moved(tool_name, bufnr)
-        end,
-      })
-    end,
-  })
+    _run_chunk(tool_name, ordered[idx], all_lines, function(new_flags, meta)
+      local s = state[tool_name] and state[tool_name][bufnr]
+      if not s or not s.active then return end  -- cleared mid-run
+
+      if new_flags then
+        local group_remap = {}
+        for _, flag in ipairs(new_flags) do
+          if flag.group ~= nil then
+            if not group_remap[flag.group] then
+              group_offset            = group_offset + 1
+              group_remap[flag.group] = group_offset
+            end
+            flag.group = group_remap[flag.group]
+          end
+          table.insert(s.flags, flag)
+          total_count = total_count + 1
+        end
+        if meta then s.meta = meta end
+
+        -- Show cursor-chunk results immediately without waiting for the rest
+        if idx == 1 then
+          apply_flagged_marks(tool_name, bufnr)
+        end
+      end
+
+      process_next(idx + 1)
+    end)
+  end
+
+  process_next(1)
 end
 
 -- ---------------------------------------------------------------------------
