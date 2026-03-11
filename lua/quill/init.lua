@@ -107,6 +107,11 @@ function M.setup(opts)
     core.prev_flag()
   end, { desc = "Prev quill flag", silent = true })
 
+  -- <Leader>l. → dismiss redundancy flag pair under cursor
+  vim.keymap.set("n", "<Leader>l.", function()
+    core.dismiss_flag("redundancy")
+  end, { desc = "Dismiss redundancy flag under cursor", silent = true })
+
   vim.notify(
     "[quill.nvim] ready — " ..
     "lr/lR/lw/lp/lt/lg  (Tier 1) · " ..

@@ -631,6 +631,64 @@ function M.export_report(bufnr)
 end
 
 -- ---------------------------------------------------------------------------
+-- dismiss_flag(tool_name, bufnr)
+-- Remove the flag (and all group-mates) under the cursor for one tool.
+-- ---------------------------------------------------------------------------
+
+function M.dismiss_flag(tool_name, bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local s = state[tool_name] and state[tool_name][bufnr]
+  if not s or not s.active then
+    vim.notify("[quill] No active " .. tool_name .. " flags.", vim.log.levels.WARN)
+    return
+  end
+
+  local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+  row = row - 1
+
+  -- Collect groups (and ungrouped flags) under cursor
+  local dismiss_groups = {}
+  local dismiss_solo   = {}
+  for _, flag in ipairs(s.flags) do
+    if flag.s_line == row and col >= flag.s_col and col < flag.e_col then
+      if flag.group ~= nil then
+        dismiss_groups[flag.group] = true
+      else
+        local key = flag.s_line .. ":" .. flag.s_col
+        dismiss_solo[key] = true
+      end
+    end
+  end
+
+  if not next(dismiss_groups) and not next(dismiss_solo) then
+    vim.notify("[quill/" .. tool_name .. "] No flag under cursor.", vim.log.levels.WARN)
+    return
+  end
+
+  -- Filter out dismissed flags
+  local kept = {}
+  for _, flag in ipairs(s.flags) do
+    local drop = false
+    if flag.group ~= nil and dismiss_groups[flag.group] then
+      drop = true
+    elseif flag.group == nil then
+      local key = flag.s_line .. ":" .. flag.s_col
+      if dismiss_solo[key] then drop = true end
+    end
+    if not drop then table.insert(kept, flag) end
+  end
+
+  s.flags = kept
+  clear_marks(tool_name, bufnr)
+  apply_flagged_marks(tool_name, bufnr)
+  vim.notify(
+    string.format("[quill/%s] Dismissed. %d flag%s remaining.",
+      tool_name, #kept, #kept == 1 and "" or "s"),
+    vim.log.levels.INFO
+  )
+end
+
+-- ---------------------------------------------------------------------------
 -- Flag navigation
 -- ---------------------------------------------------------------------------
 
