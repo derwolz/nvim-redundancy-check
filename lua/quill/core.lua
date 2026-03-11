@@ -810,6 +810,69 @@ end
 -- Remove the flag (and all group-mates) under the cursor for one tool.
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- jump_to_match(tool_name, bufnr)
+-- Jump to the paired group-mate of the flag under the cursor (like %).
+-- If multiple matches exist, cycles forward through them with wrap.
+-- ---------------------------------------------------------------------------
+
+function M.jump_to_match(tool_name, bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local s = state[tool_name] and state[tool_name][bufnr]
+  if not s or not s.active then
+    vim.notify("[quill] No active " .. tool_name .. " flags.", vim.log.levels.WARN)
+    return
+  end
+
+  local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+  row = row - 1
+
+  -- Collect groups under cursor
+  local cursor_groups = {}
+  for _, flag in ipairs(s.flags) do
+    if flag.s_line == row and col >= flag.s_col and col < flag.e_col then
+      if flag.group ~= nil then
+        cursor_groups[flag.group] = true
+      end
+    end
+  end
+
+  if not next(cursor_groups) then
+    vim.notify("[quill/" .. tool_name .. "] No match pair under cursor.", vim.log.levels.WARN)
+    return
+  end
+
+  -- Collect group-mates that are NOT at the cursor
+  local targets = {}
+  for _, flag in ipairs(s.flags) do
+    if flag.group ~= nil and cursor_groups[flag.group] then
+      if not (flag.s_line == row and col >= flag.s_col and col < flag.e_col) then
+        table.insert(targets, flag)
+      end
+    end
+  end
+
+  if #targets == 0 then
+    vim.notify("[quill/" .. tool_name .. "] No match found.", vim.log.levels.WARN)
+    return
+  end
+
+  table.sort(targets, function(a, b)
+    return a.s_line < b.s_line or (a.s_line == b.s_line and a.s_col < b.s_col)
+  end)
+
+  -- Jump to first target after cursor, wrap to start if none
+  local target
+  for _, t in ipairs(targets) do
+    if t.s_line > row or (t.s_line == row and t.s_col > col) then
+      target = t; break
+    end
+  end
+  target = target or targets[1]
+
+  vim.api.nvim_win_set_cursor(0, { target.s_line + 1, target.s_col })
+end
+
 function M.dismiss_flag(tool_name, bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   local s = state[tool_name] and state[tool_name][bufnr]

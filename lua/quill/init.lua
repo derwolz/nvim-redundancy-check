@@ -167,6 +167,11 @@ function M.setup(opts)
     core.dismiss_flag("redundancy")
   end, { desc = "Dismiss redundancy flag under cursor", silent = true })
 
+  -- <Leader>l% → jump to paired match of redundancy flag under cursor
+  vim.keymap.set("n", "<Leader>l%", function()
+    core.jump_to_match("redundancy")
+  end, { desc = "Jump to redundancy match under cursor", silent = true })
+
   vim.notify(
     "[quill.nvim] ready — " ..
     "lr/lR/lw/lp/lt/lg  (Tier 1) · " ..
