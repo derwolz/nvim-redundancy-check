@@ -5,6 +5,60 @@ local M = {}
 
 local core = require("quill.core")
 
+-- ---------------------------------------------------------------------------
+-- Dependency management
+-- ---------------------------------------------------------------------------
+
+local function _plugin_root()
+  local src = debug.getinfo(1, "S").source:sub(2)
+  return vim.fn.fnamemodify(src, ":h:h:h")
+end
+
+local function _python_exe()
+  return vim.fn.exepath("python3") ~= "" and "python3" or "python"
+end
+
+-- Install Python deps via pip if rapidfuzz is missing.
+-- Called once from setup(); does nothing if rapidfuzz is already present.
+local function _ensure_deps()
+  local py = _python_exe()
+  vim.fn.jobstart({ py, "-c", "import rapidfuzz" }, {
+    on_exit = function(_, code)
+      if code == 0 then return end  -- already installed
+      local req = _plugin_root() .. "/python/requirements.txt"
+      vim.notify("[quill] Installing rapidfuzz (one-time)…", vim.log.levels.INFO)
+      vim.fn.jobstart({ py, "-m", "pip", "install", "-r", req, "--quiet" }, {
+        on_exit = function(_, c)
+          if c == 0 then
+            vim.notify("[quill] rapidfuzz installed — fast analysis active.", vim.log.levels.INFO)
+          else
+            vim.notify(
+              "[quill] Could not auto-install rapidfuzz. Run: pip install rapidfuzz",
+              vim.log.levels.WARN
+            )
+          end
+        end,
+      })
+    end,
+  })
+end
+
+-- :QuillInstallDeps — force-reinstall Python dependencies
+vim.api.nvim_create_user_command("QuillInstallDeps", function()
+  local py  = _python_exe()
+  local req = _plugin_root() .. "/python/requirements.txt"
+  vim.notify("[quill] Installing Python dependencies…", vim.log.levels.INFO)
+  vim.fn.jobstart({ py, "-m", "pip", "install", "-r", req }, {
+    on_exit = function(_, code)
+      if code == 0 then
+        vim.notify("[quill] Dependencies installed.", vim.log.levels.INFO)
+      else
+        vim.notify("[quill] Install failed. Try: pip install rapidfuzz", vim.log.levels.ERROR)
+      end
+    end,
+  })
+end, { desc = "Install quill Python dependencies (rapidfuzz)" })
+
 ---@class QuillConfig
 ---@field frequency_sensitivity number  How hard to dampen frequent words (default 50)
 ---@field decay_rate             number  Logarithmic decay rate (default 2.0)
@@ -74,6 +128,7 @@ function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", defaults, opts or {})
 
   core.setup_config(M.config)
+  _ensure_deps()
 
   for _, tool in ipairs(TOOLS) do
     core.register_tool(tool.name, tool.hl_flagged, tool.hl_related)
