@@ -21,6 +21,10 @@ local cfg = {}
 local _hover_win        = nil   -- current hover float window ID
 local _hover_registered = {}    -- [bufnr] = true once hover autocmd is set up
 
+-- Edit-mode state (InsertEnter/Leave partial re-analysis)
+local _edit_line       = {}    -- ["tool_bufnr"] = center line when insert started
+local _edit_registered = {}    -- ["tool_bufnr"] = true once edit autocmds are set up
+
 -- ---------------------------------------------------------------------------
 -- Config
 -- ---------------------------------------------------------------------------
@@ -112,6 +116,95 @@ local function _ensure_hover_autocmd(bufnr)
 end
 
 -- ---------------------------------------------------------------------------
+-- Edit autocmds: InsertEnter clears the line; InsertLeave re-analyses ±500 words
+-- ---------------------------------------------------------------------------
+
+-- Returns {win_start, win_end} (0-indexed inclusive) covering ~500 words
+-- outward from center_line in bufnr.
+local function _word_window(bufnr, center_line)
+  local total = vim.api.nvim_buf_line_count(bufnr)
+  local budget = 500
+  local start_l = center_line
+  local end_l   = center_line
+
+  -- Expand upward then downward alternately until budget consumed
+  local up, down = center_line - 1, center_line + 1
+  local words_counted = 0
+  -- Count center line first
+  local cl = vim.api.nvim_buf_get_lines(bufnr, center_line, center_line + 1, false)[1] or ""
+  for _ in cl:gmatch("%S+") do words_counted = words_counted + 1 end
+
+  while words_counted < budget do
+    local moved = false
+    if up >= 0 then
+      local ln = vim.api.nvim_buf_get_lines(bufnr, up, up + 1, false)[1] or ""
+      for _ in ln:gmatch("%S+") do words_counted = words_counted + 1 end
+      start_l = up
+      up = up - 1
+      moved = true
+    end
+    if words_counted < budget and down < total then
+      local ln = vim.api.nvim_buf_get_lines(bufnr, down, down + 1, false)[1] or ""
+      for _ in ln:gmatch("%S+") do words_counted = words_counted + 1 end
+      end_l = down
+      down = down + 1
+      moved = true
+    end
+    if not moved then break end
+  end
+
+  return start_l, end_l
+end
+
+local function _ensure_edit_autocmd(tool_name, bufnr)
+  local key = tool_name .. "_" .. bufnr
+  if _edit_registered[key] then return end
+  _edit_registered[key] = true
+
+  local aug = vim.api.nvim_create_augroup("QuillEdit_" .. tool_name .. "_" .. bufnr, { clear = true })
+
+  vim.api.nvim_create_autocmd("InsertEnter", {
+    buffer   = bufnr,
+    group    = aug,
+    callback = function()
+      local s = state[tool_name] and state[tool_name][bufnr]
+      if not s or not s.active then return end
+      local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+      _edit_line[key] = row
+      -- Drop flags on this line and their group-mates so no stale marks crash
+      local drop_groups = {}
+      for _, flag in ipairs(s.flags) do
+        if flag.s_line == row and flag.group ~= nil then
+          drop_groups[flag.group] = true
+        end
+      end
+      local kept = {}
+      for _, flag in ipairs(s.flags) do
+        local drop = flag.s_line == row
+                     or (flag.group ~= nil and drop_groups[flag.group])
+        if not drop then table.insert(kept, flag) end
+      end
+      s.flags = kept
+      clear_marks(tool_name, bufnr)
+      apply_flagged_marks(tool_name, bufnr)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("InsertLeave", {
+    buffer   = bufnr,
+    group    = aug,
+    callback = function()
+      local s = state[tool_name] and state[tool_name][bufnr]
+      if not s or not s.active then return end
+      local center = _edit_line[key]
+      if center == nil then return end
+      _edit_line[key] = nil
+      M._partial_reanalyse(tool_name, bufnr, center)
+    end,
+  })
+end
+
+-- ---------------------------------------------------------------------------
 -- Utility: resolve python backend path
 -- ---------------------------------------------------------------------------
 
@@ -196,12 +289,14 @@ local function apply_flagged_marks(tool_name, bufnr)
   local hl = hl_defs[tool_name]
   local line_len = _make_line_len_cache(bufnr)
   for _, flag in ipairs(s.flags) do
+    local ll = line_len(flag.s_line)
+    if flag.s_col >= ll then goto continue end   -- line shrank; skip stale mark
     local sev     = flag.severity or 0
     local sign_ch = sev >= 0.7 and "● " or (sev >= 0.4 and "▸ " or "· ")
     local vt      = cfg.virtual_text
                     and {{ string.format(" · %d%%", math.floor(sev * 100)), "Comment" }}
                     or nil
-    local safe_e_col = math.min(flag.e_col, line_len(flag.s_line))
+    local safe_e_col = math.min(flag.e_col, ll)
     vim.api.nvim_buf_set_extmark(bufnr, ns, flag.s_line, flag.s_col, {
       end_row       = flag.s_line,
       end_col       = safe_e_col,
@@ -212,6 +307,7 @@ local function apply_flagged_marks(tool_name, bufnr)
       virt_text     = vt,
       virt_text_pos = "eol",
     })
+    ::continue::
   end
 end
 
@@ -269,6 +365,84 @@ local function on_cursor_moved(tool_name, bufnr)
       place_mark(tool_name, bufnr, flag.s_line, flag.s_col, flag.e_col, hl.related)
     end
   end
+end
+
+-- ---------------------------------------------------------------------------
+-- _partial_reanalyse(tool_name, bufnr, center_line)
+-- Re-run the backend on the ±500-word window around center_line and splice
+-- the fresh flags back into state, replacing anything in that range.
+-- ---------------------------------------------------------------------------
+
+function M._partial_reanalyse(tool_name, bufnr, center_line)
+  local win_start, win_end = _word_window(bufnr, center_line)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, win_start, win_end + 1, false)
+
+  local tmp = vim.fn.tempname() .. ".txt"
+  vim.fn.writefile(lines, tmp)
+
+  local stdout_chunks = {}
+  vim.fn.jobstart({
+    python_exe(), backend_path(), "--tool", tool_name, tmp, vim.json.encode(cfg)
+  }, {
+    stdout_buffered = true,
+    on_stdout = function(_, data)
+      for _, chunk in ipairs(data) do table.insert(stdout_chunks, chunk) end
+    end,
+    on_stderr = function(_, data)
+      for _, ln in ipairs(data) do
+        if ln ~= "" then
+          vim.notify("[quill/" .. tool_name .. "] " .. ln, vim.log.levels.WARN)
+        end
+      end
+    end,
+    on_exit = function(_, code)
+      vim.fn.delete(tmp)
+      if code ~= 0 then return end
+      local ok, parsed = pcall(vim.json.decode, table.concat(stdout_chunks, "\n"))
+      if not ok or type(parsed) ~= "table" or not parsed.flags then return end
+
+      local s = state[tool_name] and state[tool_name][bufnr]
+      if not s or not s.active then return end
+
+      -- Remove all flags in the window (and group-mates outside it that pair
+      -- with a flag inside — the whole pair is now stale)
+      local stale_groups = {}
+      for _, flag in ipairs(s.flags) do
+        if flag.s_line >= win_start and flag.s_line <= win_end and flag.group ~= nil then
+          stale_groups[flag.group] = true
+        end
+      end
+      local kept = {}
+      for _, flag in ipairs(s.flags) do
+        local in_win  = flag.s_line >= win_start and flag.s_line <= win_end
+        local orphan  = flag.group ~= nil and stale_groups[flag.group]
+        if not in_win and not orphan then table.insert(kept, flag) end
+      end
+
+      -- Remap incoming group IDs to avoid collisions with kept flags
+      local max_group = 0
+      for _, flag in ipairs(kept) do
+        if (flag.group or 0) > max_group then max_group = flag.group end
+      end
+      local group_remap = {}
+      for _, flag in ipairs(parsed.flags) do
+        local nf = vim.deepcopy(flag)
+        nf.s_line = flag.s_line + win_start
+        if flag.group ~= nil then
+          if not group_remap[flag.group] then
+            max_group = max_group + 1
+            group_remap[flag.group] = max_group
+          end
+          nf.group = group_remap[flag.group]
+        end
+        table.insert(kept, nf)
+      end
+
+      s.flags = kept
+      clear_marks(tool_name, bufnr)
+      apply_flagged_marks(tool_name, bufnr)
+    end,
+  })
 end
 
 -- ---------------------------------------------------------------------------
@@ -345,6 +519,7 @@ function M.run(tool_name, bufnr)
       }
 
       _ensure_hover_autocmd(bufnr)
+      _ensure_edit_autocmd(tool_name, bufnr)
       clear_marks(tool_name, bufnr)
       apply_flagged_marks(tool_name, bufnr)
 
