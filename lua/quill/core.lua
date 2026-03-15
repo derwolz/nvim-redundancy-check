@@ -122,11 +122,11 @@ end
 -- Edit autocmds: InsertEnter clears the line; InsertLeave re-analyses ±500 words
 -- ---------------------------------------------------------------------------
 
--- Returns {win_start, win_end} (0-indexed inclusive) covering ~500 words
+-- Returns {win_start, win_end} (0-indexed inclusive) covering ~budget words
 -- outward from center_line in bufnr.
-local function _word_window(bufnr, center_line)
+local function _word_window(bufnr, center_line, budget)
   local total = vim.api.nvim_buf_line_count(bufnr)
-  local budget = 500
+  budget = budget or 500
   local start_l = center_line
   local end_l   = center_line
 
@@ -376,8 +376,8 @@ end
 -- the fresh flags back into state, replacing anything in that range.
 -- ---------------------------------------------------------------------------
 
-function M._partial_reanalyse(tool_name, bufnr, center_line)
-  local win_start, win_end = _word_window(bufnr, center_line)
+function M._partial_reanalyse(tool_name, bufnr, center_line, budget, notify_done)
+  local win_start, win_end = _word_window(bufnr, center_line, budget)
   local lines = vim.api.nvim_buf_get_lines(bufnr, win_start, win_end + 1, false)
 
   local tmp = vim.fn.tempname() .. ".txt"
@@ -444,6 +444,13 @@ function M._partial_reanalyse(tool_name, bufnr, center_line)
       s.flags = kept
       clear_marks(tool_name, bufnr)
       apply_flagged_marks(tool_name, bufnr)
+      if notify_done then
+        local n = #s.flags
+        vim.notify(
+          string.format("[quill/%s] %d flag%s.", tool_name, n, n == 1 and "" or "s"),
+          vim.log.levels.INFO
+        )
+      end
     end,
   })
 end
@@ -590,76 +597,15 @@ function M.run(tool_name, bufnr)
     callback = function() on_cursor_moved(tool_name, bufnr) end,
   })
 
-  local chunks, all_lines = _chunk_boundaries(bufnr)
-  if #chunks == 0 then
+  if vim.api.nvim_buf_line_count(bufnr) == 0 then
     vim.notify("[quill/" .. tool_name .. "] Buffer is empty.", vim.log.levels.WARN)
     return
   end
 
-  -- Reorder so cursor chunk runs first → immediate feedback on visible area
+  -- Analyse only the 200-word window around the cursor to keep memory low
   local cursor_line = vim.api.nvim_win_get_cursor(0)[1] - 1
-  local cursor_idx  = 1
-  for k, chunk in ipairs(chunks) do
-    if cursor_line >= chunk.start and cursor_line < chunk.primary_end then
-      cursor_idx = k; break
-    end
-  end
-  local ordered = { chunks[cursor_idx] }
-  for k, chunk in ipairs(chunks) do
-    if k ~= cursor_idx then table.insert(ordered, chunk) end
-  end
-
-  local group_offset = 0
-  local total_count  = 0
-
-  vim.notify(
-    string.format("[quill/%s] Analysing (%d chunk%s)…",
-      tool_name, #ordered, #ordered == 1 and "" or "s"),
-    vim.log.levels.INFO
-  )
-
-  local function process_next(idx)
-    if idx > #ordered then
-      -- All chunks done — final redraw with every flag
-      clear_marks(tool_name, bufnr)
-      apply_flagged_marks(tool_name, bufnr)
-      vim.notify(
-        string.format("[quill/%s] %d flag%s.", tool_name, total_count, total_count == 1 and "" or "s"),
-        vim.log.levels.INFO
-      )
-      return
-    end
-
-    _run_chunk(tool_name, ordered[idx], all_lines, function(new_flags, meta)
-      local s = state[tool_name] and state[tool_name][bufnr]
-      if not s or not s.active then return end  -- cleared mid-run
-
-      if new_flags then
-        local group_remap = {}
-        for _, flag in ipairs(new_flags) do
-          if flag.group ~= nil then
-            if not group_remap[flag.group] then
-              group_offset            = group_offset + 1
-              group_remap[flag.group] = group_offset
-            end
-            flag.group = group_remap[flag.group]
-          end
-          table.insert(s.flags, flag)
-          total_count = total_count + 1
-        end
-        if meta then s.meta = meta end
-
-        -- Show cursor-chunk results immediately without waiting for the rest
-        if idx == 1 then
-          apply_flagged_marks(tool_name, bufnr)
-        end
-      end
-
-      process_next(idx + 1)
-    end)
-  end
-
-  process_next(1)
+  vim.notify("[quill/" .. tool_name .. "] Analysing…", vim.log.levels.INFO)
+  M._partial_reanalyse(tool_name, bufnr, cursor_line, 200, true)
 end
 
 -- ---------------------------------------------------------------------------
