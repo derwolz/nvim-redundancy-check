@@ -162,15 +162,24 @@ function M.setup(opts)
     core.prev_flag()
   end, { desc = "Prev quill flag", silent = true })
 
-  -- <Leader>l. → dismiss redundancy flag pair under cursor
+  -- <Leader>l. → dismiss flag under cursor for the active tool
   vim.keymap.set("n", "<Leader>l.", function()
-    core.dismiss_flag("redundancy")
-  end, { desc = "Dismiss redundancy flag under cursor", silent = true })
+    local tool = core.get_active_tool()
+    if not tool then
+      vim.notify("[quill] No active analysis.", vim.log.levels.WARN); return
+    end
+    core.dismiss_flag(tool)
+  end, { desc = "Dismiss flag under cursor (active tool)", silent = true })
 
-  -- <Leader>l% → jump to paired match of redundancy flag under cursor
+  -- <Leader>l% → next flag for the active tool
   vim.keymap.set("n", "<Leader>l%", function()
-    core.jump_to_match("redundancy")
-  end, { desc = "Jump to redundancy match under cursor", silent = true })
+    local bufnr = vim.api.nvim_get_current_buf()
+    local tool = core.get_active_tool(bufnr)
+    if not tool then
+      vim.notify("[quill] No active analysis.", vim.log.levels.WARN); return
+    end
+    core.next_flag(bufnr)
+  end, { desc = "Next flag (active tool)", silent = true })
 
   vim.notify(
     "[quill.nvim] ready — " ..
@@ -189,7 +198,8 @@ M.run_all       = core.run_all
 M.get_state     = core.get_state
 M.summary_panel = core.summary_panel
 M.export_report = core.export_report
-M.next_flag     = core.next_flag
-M.prev_flag     = core.prev_flag
+M.next_flag       = core.next_flag
+M.prev_flag       = core.prev_flag
+M.get_active_tool = core.get_active_tool
 
 return M

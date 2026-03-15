@@ -57,7 +57,9 @@ _DEFAULTS = {
     "decay_rate":                      2.0,
     "similarity_threshold":            0.82,
     "min_severity":                    0.03,
-    "window":                          300,
+    "window":                          200,
+    "fuzzy_sentence_window":           20,   # max word-distance for non-exact matches
+    "fuzzy_decay_multiplier":          3.0,  # steeper dropoff for fuzzy pairs
     "stopword_sensitivity_multiplier": 10.0,
 }
 
@@ -103,12 +105,14 @@ def _freq_weight(word: str, counter: Counter, total: int, sensitivity: float,
 def analyse(text: str, config: Dict[str, Any]) -> Dict[str, Any]:
     cfg = {**_DEFAULTS, **config}
 
-    freq_sens     = float(cfg["frequency_sensitivity"])
-    decay_rate    = float(cfg["decay_rate"])
-    sim_thresh    = float(cfg["similarity_threshold"])
-    min_sev       = float(cfg["min_severity"])
-    window        = int(cfg["window"])
-    stopword_mult = float(cfg["stopword_sensitivity_multiplier"])
+    freq_sens        = float(cfg["frequency_sensitivity"])
+    decay_rate       = float(cfg["decay_rate"])
+    sim_thresh       = float(cfg["similarity_threshold"])
+    min_sev          = float(cfg["min_severity"])
+    window           = int(cfg["window"])
+    fuzzy_win        = int(cfg["fuzzy_sentence_window"])
+    fuzzy_decay_mult = float(cfg["fuzzy_decay_multiplier"])
+    stopword_mult    = float(cfg["stopword_sensitivity_multiplier"])
 
     positions = build_positions(text)
     if not positions:
@@ -150,10 +154,18 @@ def analyse(text: str, config: Dict[str, Any]) -> Dict[str, Any]:
             if sim < sim_thresh:
                 continue
 
-            dist = j - i
+            dist     = j - i
+            is_exact = (wa == wb)
+
+            # Issue #1: fuzzy (non-exact) matches only matter within ~1 sentence
+            if not is_exact and dist > fuzzy_win:
+                continue
+
             fwa  = _freq_weight(wa, counter, total, freq_sens, stopword_mult)
             fwb  = _freq_weight(wb, counter, total, freq_sens, stopword_mult)
-            dec  = _decay(dist, decay_rate)
+            # Apply steeper decay for fuzzy pairs
+            eff_rate = decay_rate if is_exact else decay_rate * fuzzy_decay_mult
+            dec  = _decay(dist, eff_rate)
             sev  = sim * fwa * fwb * dec
 
             if sev < min_sev:

@@ -17,6 +17,9 @@ local state = {}
 -- Plugin config (set via setup_config)
 local cfg = {}
 
+-- Single active tool per buffer
+local _active_tool = {}   -- [bufnr] = tool_name | nil
+
 -- Hover float state
 local _hover_win        = nil   -- current hover float window ID
 local _hover_registered = {}    -- [bufnr] = true once hover autocmd is set up
@@ -559,6 +562,20 @@ function M.run(tool_name, bufnr)
 
   if vim.bo[bufnr].modified then vim.cmd("write") end
 
+  -- Clear any other active tool for this buffer (only one at a time)
+  for other, tool_state in pairs(state) do
+    if other ~= tool_name then
+      local s = tool_state[bufnr]
+      if s and s.active then
+        s.active = false
+        clear_marks(other, bufnr)
+        local aug = "QuillCursor_" .. other .. "_" .. bufnr
+        pcall(vim.api.nvim_del_augroup_by_name, aug)
+      end
+    end
+  end
+  _active_tool[bufnr] = tool_name
+
   -- Fresh state; marks cleared immediately
   state[tool_name][bufnr] = { flags={}, marks={}, active=true, meta={}, filepath=filepath }
   clear_marks(tool_name, bufnr)
@@ -655,6 +672,9 @@ function M.clear(tool_name, bufnr)
   clear_marks(tool_name, bufnr)
   if state[tool_name] and state[tool_name][bufnr] then
     state[tool_name][bufnr].active = false
+  end
+  if _active_tool[bufnr] == tool_name then
+    _active_tool[bufnr] = nil
   end
   local augroup = "QuillCursor_" .. tool_name .. "_" .. bufnr
   pcall(vim.api.nvim_del_augroup_by_name, augroup)
@@ -1076,6 +1096,11 @@ function M.prev_flag(bufnr)
   local f = all[#all]
   vim.api.nvim_win_set_cursor(0, { f.s_line + 1, f.s_col })
   vim.notify("[quill] Wrapped to last flag.", vim.log.levels.INFO)
+end
+
+function M.get_active_tool(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  return _active_tool[bufnr]
 end
 
 return M
