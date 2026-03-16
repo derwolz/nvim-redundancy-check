@@ -181,13 +181,6 @@ function M.setup(opts)
     core.next_flag(bufnr)
   end, { desc = "Next flag (active tool)", silent = true })
 
-  vim.notify(
-    "[quill.nvim] ready — " ..
-    "lr/lR/lw/lp/lt/lg  (Tier 1) · " ..
-    "lv/lT/ls/le/la/lc/lS/lm  (Tier 2) · " ..
-    "ll=all  li=summary  lE=export  ln/lN=next/prev flag",
-    vim.log.levels.INFO
-  )
 end
 
 -- Expose core functions for manual use
